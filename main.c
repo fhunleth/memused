@@ -499,8 +499,16 @@ static int mapped_file_compare(const void *mf1, const void *mf2)
         return 1;
     else if (unique_mappings1 > unique_mappings2)
         return -1;
-    else
-        return 0;
+    else {
+        size_t shared_mappings1 = mapped_file1->shared_data + mapped_file1->shared_text;
+        size_t shared_mappings2 = mapped_file2->shared_data + mapped_file2->shared_text;
+        if (shared_mappings1 < shared_mappings2)
+            return 1;
+        else if (shared_mappings1 > shared_mappings2)
+            return -1;
+        else
+            return 0;
+    }
 }
 
 static MappedFile *sort_mapped_files(MappedFile *mapped_files)
