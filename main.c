@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 typedef struct MappedFile
 {
@@ -16,12 +17,7 @@ typedef struct MappedFile
     int inode;
     char *filename;
 
-    // Read/write/execute perms on the mapped file.
-    // Inferred from the various mappings.
-    int perms;
-
-    // The length in bytes of the two bitmaps
-    // below.
+    // The length in bytes of the bitmaps below.
     int bitmap_length;
 
     // Bitmap of all page-sized blocks within
@@ -31,6 +27,16 @@ typedef struct MappedFile
     // Bitmap of all page-sized blocks that
     // have been mapped more than once.
     unsigned char *shared_pages;
+
+    // Bitmap of all page-sized blocks that
+    // are writable.
+    unsigned char *writable_pages;
+
+    // Stats
+    size_t unique_text;
+    size_t shared_text;
+    size_t unique_data;
+    size_t shared_data;
 } MappedFile;
 
 typedef struct Mapping
@@ -91,6 +97,17 @@ static bool is_pid_dir(const char *filename)
     return true;
 }
 
+static char *strtoptr(const char *str)
+{
+#if __SIZEOF_POINTER__ == __SIZEOF_LONG__
+    return (char *) strtoul(str, 0, 16);
+#elif __SIZEOF_POINTER__ == __SIZEOF_LONG_LONG__
+    return (char *) strtoull(str, 0, 16);
+#else
+#error Unknown pointer size
+#endif
+}
+
 static Mapping *load_mappings(const char *mapfile)
 {
     Mapping *mappings = 0;
@@ -109,11 +126,11 @@ static Mapping *load_mappings(const char *mapfile)
             free(mapping);
             break;
         }
-        mapping->start_address = (char *) strtoull(str, 0, 16);
+        mapping->start_address = strtoptr(str);
 
         // End address
         str = strtok(NULL, " \t");
-        char *end_address = (char *) strtoull(str, 0, 16);
+        char *end_address = strtoptr(str);
         mapping->length = end_address - mapping->start_address;
 
         // Permissions
@@ -160,10 +177,16 @@ static Process *load_all_mappings()
     DIR *d = opendir("/proc");
     struct dirent *entry = NULL;
 
+    pid_t self = getpid();
+
     while ((entry = readdir(d))) {
         if (is_pid_dir(entry->d_name)) {
+            pid_t pid = strtol(entry->d_name, 0, 10);
+            if (pid == self)
+                continue;
+
             Process *process = (Process *) malloc(sizeof(Process));
-            process->pid = strtol(entry->d_name, 0, 10);
+            process->pid = pid;
 
             char mapfile[PATH_MAX];
             sprintf(mapfile, "/proc/%d/maps", process->pid);
@@ -194,7 +217,7 @@ static MappedFile *find_mapped_file(MappedFile *mappedFiles, int major, int mino
 static void add_or_update_mapped_file(MappedFile **mappedFiles, Mapping *mapping)
 {
     // Check if this mapping doesn't go to a file
-    if (mapping->major == 0)
+    if (mapping->major == 0 && mapping->minor == 0)
         return;
 
     int lastBitOffset = ((mapping->offset + mapping->length) / 4096 / 8) + 1;
@@ -215,21 +238,25 @@ static void add_or_update_mapped_file(MappedFile **mappedFiles, Mapping *mapping
         mappedFile->bitmap_length = max(1024, lastBitOffset);
         mappedFile->mapped_pages = malloc(mappedFile->bitmap_length);
         mappedFile->shared_pages = malloc(mappedFile->bitmap_length);
+        mappedFile->writable_pages = malloc(mappedFile->bitmap_length);
         memset(mappedFile->mapped_pages, 0, mappedFile->bitmap_length);
         memset(mappedFile->shared_pages, 0, mappedFile->bitmap_length);
+        memset(mappedFile->writable_pages, 0, mappedFile->bitmap_length);
     }
 
     // Expand the bitmap if necessary.
     if (mappedFile->bitmap_length < lastBitOffset) {
         mappedFile->mapped_pages = realloc(mappedFile->mapped_pages, lastBitOffset);
         mappedFile->shared_pages = realloc(mappedFile->shared_pages, lastBitOffset);
-        memset(&mappedFile->mapped_pages[mappedFile->bitmap_length], 0, lastBitOffset - mappedFile->bitmap_length);
-        memset(&mappedFile->shared_pages[mappedFile->bitmap_length], 0, lastBitOffset - mappedFile->bitmap_length);
+        mappedFile->writable_pages = realloc(mappedFile->writable_pages, lastBitOffset);
+
+        int bytesAdded = lastBitOffset - mappedFile->bitmap_length;
+
+        memset(&mappedFile->mapped_pages[mappedFile->bitmap_length], 0, bytesAdded);
+        memset(&mappedFile->shared_pages[mappedFile->bitmap_length], 0, bytesAdded);
+        memset(&mappedFile->writable_pages[mappedFile->bitmap_length], 0, bytesAdded);
         mappedFile->bitmap_length = lastBitOffset;
     }
-
-    // Update permissions
-    mappedFile->perms |= mapping->perms;
 
     // Fill out the bitmap.
     size_t lastOffset = mapping->offset + mapping->length;
@@ -242,6 +269,9 @@ static void add_or_update_mapped_file(MappedFile **mappedFiles, Mapping *mapping
             mappedFile->shared_pages[bitOffset] |= bitMask;
         else
             mappedFile->mapped_pages[bitOffset] |= bitMask;
+
+        if (mapping->perms & PROT_WRITE)
+            mappedFile->writable_pages[bitOffset] |= bitMask;
     }
 }
 
@@ -302,13 +332,12 @@ static void compute_process_stats(Process *process, MappedFile *mappedFiles)
         if (mapping->perms == 0)
             continue;
 
-        size_t uniqueLength;
-        size_t sharedLength;
+        size_t uniqueLength = 0;
+        size_t sharedLength = 0;
         if (mapping->major == 0) {
             // If not mapped to a device, then this memory is only mapped
             // to this process. ** Check assumption **
             uniqueLength = mapping->length;
-            sharedLength = 0;
         } else {
             lookup_mapping(mapping, mappedFiles, &uniqueLength, &sharedLength);
         }
@@ -342,43 +371,44 @@ static int count_bits(unsigned char c)
     return count;
 }
 
-static void compute_shared_mappings(MappedFile *mappedFile,
-                                    size_t *shared_text,
-                                    size_t *shared_data)
+static void compute_mapped_file_stats(MappedFile *mappedFile)
 {
     // Count the number of bits.
-    int total_bits = 0;
+    int shared_bits = 0;
+    int private_bits = 0;
+    int shared_writable_bits = 0;
+    int private_writable_bits = 0;
     int i;
-    for (i = 0; i < mappedFile->bitmap_length; i++)
-        total_bits += count_bits(mappedFile->shared_pages[i]);
+    for (i = 0; i < mappedFile->bitmap_length; i++) {
+        unsigned char shared = mappedFile->shared_pages[i];
+        unsigned char priv = mappedFile->mapped_pages[i] & ~mappedFile->shared_pages[i];
 
-    if (mappedFile->perms & PROT_WRITE)
-        *shared_data = total_bits * 4096;
-    else
-        *shared_text = total_bits * 4096;
+        shared_bits += count_bits(shared);
+        private_bits += count_bits(priv);
+
+        shared_writable_bits += count_bits(mappedFile->writable_pages[i] & shared);
+        private_writable_bits += count_bits(mappedFile->writable_pages[i] & priv);
+    }
+
+    mappedFile->shared_data = shared_writable_bits * 4096;
+    mappedFile->shared_text = (shared_bits - shared_writable_bits) * 4096;
+    mappedFile->unique_data = private_writable_bits * 4096;
+    mappedFile->unique_text = (private_bits - private_writable_bits) * 4096;
 }
 
-static void compute_unique_mappings(MappedFile *mappedFile,
-                                    size_t *unique_text,
-                                    size_t *unique_data)
+static void compute_all_mapped_file_stats(MappedFile *mappedFiles)
 {
-    // Count the number of bits.
-    int total_bits = 0;
-    int i;
-    for (i = 0; i < mappedFile->bitmap_length; i++)
-        total_bits += count_bits(mappedFile->mapped_pages[i] & ~mappedFile->shared_pages[i]);
-
-    if (mappedFile->perms & PROT_WRITE)
-        *unique_data = total_bits * 4096;
-    else
-        *unique_text = total_bits * 4096;
+    while (mappedFiles) {
+        compute_mapped_file_stats(mappedFiles);
+        mappedFiles = mappedFiles->next;
+    }
 }
 
 static void compute_all_process_stats(Process *processes,
                                       MappedFile *mappedFiles,
                                       SummaryStats *stats)
 {
-    memset(stats, 0, sizeof(stats));
+    memset(stats, 0, sizeof(SummaryStats));
 
     // Compute stats for each process
     Process *process;
@@ -392,12 +422,8 @@ static void compute_all_process_stats(Process *processes,
     // Count the amount of memory that was shared between processes.
     MappedFile *mappedFile;
     for (mappedFile = mappedFiles; mappedFile != NULL; mappedFile = mappedFile->next) {
-        size_t shared_data;
-        size_t shared_text;
-
-        compute_shared_mappings(mappedFile, &shared_text, &shared_data);
-        stats->total_shared_data += shared_data;
-        stats->total_shared_text += shared_text;
+        stats->total_shared_data += mappedFile->shared_data;
+        stats->total_shared_text += mappedFile->shared_text;
     }
 
     stats->total_mapped_memory =
@@ -451,6 +477,52 @@ static Process *sort_processes(Process *processes)
     return process_array[0];
 }
 
+static int mapped_file_count(MappedFile *mapped_files)
+{
+    int i = 0;
+    while (mapped_files) {
+        mapped_files = mapped_files->next;
+        i++;
+    }
+    return i;
+}
+
+static int mapped_file_compare(const void *mf1, const void *mf2)
+{
+    const MappedFile *mapped_file1 = *(const MappedFile **) mf1;
+    const MappedFile *mapped_file2 = *(const MappedFile **) mf2;
+
+    size_t unique_mappings1 = mapped_file1->unique_data + mapped_file1->unique_text;
+    size_t unique_mappings2 = mapped_file2->unique_data + mapped_file2->unique_text;
+
+    if (unique_mappings1 < unique_mappings2)
+        return 1;
+    else if (unique_mappings1 > unique_mappings2)
+        return -1;
+    else
+        return 0;
+}
+
+static MappedFile *sort_mapped_files(MappedFile *mapped_files)
+{
+    int count = mapped_file_count(mapped_files);
+
+    MappedFile **mapped_file_array = (MappedFile **) alloca(count * sizeof(MappedFile*));
+    MappedFile *mapped_file = mapped_files;
+    int i;
+    for (i = 0; i < count; i++) {
+        mapped_file_array[i] = mapped_file;
+        mapped_file = mapped_file->next;
+    }
+
+    qsort(mapped_file_array, count, sizeof(MappedFile*), mapped_file_compare);
+
+    for (i = 0; i < count - 1; i++)
+        mapped_file_array[i]->next = mapped_file_array[i + 1];
+    mapped_file_array[count - 1]->next = 0;
+
+    return mapped_file_array[0];
+}
 static char *pid_to_name(pid_t pid)
 {
     char *filename;
@@ -496,23 +568,17 @@ static void print_stats(Process *processes, MappedFile *mappedFiles, SummaryStat
         free(name);
     }
 
-    printf("\nMapped files sorted by size mapped:\n\n");
-    printf("                Name     Unique text  Shared text  Unique data  Shared data        Total\n");
+    printf("\nMapped files sorted by size privately or uniquely mapped:\n\n");
+    printf("                Name  Unique text  Shared text  Unique data  Shared data        Total\n");
     MappedFile *mappedFile;
     for (mappedFile = mappedFiles; mappedFile != NULL; mappedFile = mappedFile->next) {
-        size_t shared_text;
-        size_t shared_data;
-        size_t unique_text;
-        size_t unique_data;
-        compute_unique_mappings(mappedFile, &unique_text, &unique_data);
-        compute_shared_mappings(mappedFile, &shared_text, &shared_data);
         printf("%20.20s %12zu %12zu %12zu %12zu %12zu\n",
                strright(mappedFile->filename, 20),
-               unique_text,
-               shared_text,
-               unique_data,
-               shared_data,
-               unique_data + unique_text + shared_data + shared_text);
+               mappedFile->unique_text,
+               mappedFile->shared_text,
+               mappedFile->unique_data,
+               mappedFile->shared_data,
+               mappedFile->unique_data + mappedFile->unique_text + mappedFile->shared_data + mappedFile->shared_text);
 
     }
 
@@ -526,16 +592,20 @@ static void print_stats(Process *processes, MappedFile *mappedFiles, SummaryStat
 
 int main(int argc, char *argv[])
 {
+    // Scan all processes and build data structures
     Process *processes = load_all_mappings();
-
     MappedFile *mappedFiles = build_mapped_file_list(processes);
 
+    // Compute stats across everything.
     SummaryStats stats;
+    compute_all_mapped_file_stats(mappedFiles);
     compute_all_process_stats(processes, mappedFiles, &stats);
 
-    // Sort the processes based on amount of memory mapped.
+    // Sort the processes and mapped files
     processes = sort_processes(processes);
+    mappedFiles = sort_mapped_files(mappedFiles);
 
+    // Display the results
     print_stats(processes, mappedFiles, &stats);
 
     exit(EXIT_SUCCESS);
