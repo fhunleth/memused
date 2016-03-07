@@ -534,16 +534,21 @@ static MappedFile *sort_mapped_files(MappedFile *mapped_files)
 static char *pid_to_name(pid_t pid)
 {
     char *filename;
-    asprintf(&filename, "/proc/%d/cmdline", pid);
+    char *f;
+    if (asprintf(&filename, "/proc/%d/cmdline", pid) == -1)
+    	return strdup("");
     FILE *fp = fopen(filename, "r");
     free(filename);
 
     if (fp) {
         char line[256];
-        fgets(line, sizeof(line), fp);
+        f = fgets(line, sizeof(line), fp);
         fclose(fp);
 
-        return strdup(line);
+        if (f == NULL)
+        	return strdup("");
+        else
+            return strdup(line);
     } else
         return strdup("");
 }
